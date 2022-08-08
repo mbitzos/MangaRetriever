@@ -92,7 +92,10 @@ class MangaFetcher(ABC):
             raise Exception("NOT_JSON")
     except Exception as e:
       self._metadata.total_failed_requests += 1
-      self._metadata.failed_request_code_map[str(e)] += 1
+      if isinstance(e, requests.HTTPError):
+        self._metadata.failed_request_code_map[response.status_code] += 1
+      else:
+        self._metadata.failed_request_code_map[str(e)] += 1
       raise e
 
 
