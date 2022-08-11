@@ -1,7 +1,12 @@
 from abc import abstractmethod, ABC
 from collections import defaultdict
 import dataclasses
+from multiprocessing.pool import INIT
+from random import randint, random
+import re
 import time
+from tkinter.tix import MAX
+from turtle import back
 from typing import Any, Optional
 
 import requests
@@ -11,6 +16,10 @@ from src.util import recorder
 from src.util.recorder import MangaDataRecorder
 from src.util.utils import JSONSerializableDataclass
 
+
+MAX_RETRIES = 3
+INITIAL_RETRY_TIMEOUT_S = 1
+RETRY_BACKOFF_MUL = 1.5
 @dataclasses.dataclass
 class FetchMetaData(JSONSerializableDataclass):
   cached: bool
@@ -54,13 +63,11 @@ class MangaFetcher(ABC):
 
     # fetch real
     manga_data = self._get_manga()
-    if write_to_disk:
-      self.recorder.write(manga_data, overwrite=True)
 
     # meta data stuff
     total_requests = self._metadata.total_requests
     total_request_time = self._metadata.total_request_time / 1e6  # ns -> ms
-    return manga_data, FetchMetaData(
+    metadata =  FetchMetaData(
       cached=False,
       total_request_time_s=round(total_request_time / 1e3,2),  # in seconds
       avg_request_time_ms=0 if not total_requests else round(total_request_time / total_requests, 2),
@@ -70,32 +77,45 @@ class MangaFetcher(ABC):
       dynamic_data=self._metadata.dynamic_data,
     )
 
+    # persist to disk
+    if write_to_disk:
+      self.recorder.write(manga_data, overwrite=True)
+      self.recorder.write_metadata(metadata, overwrite=True)
+    return manga_data, metadata
+
   def get_request(self, url: str, query_params: dict[str, Any], raise_error: bool =True) -> tuple[dict, int]:
     """
     performs a get requests
     """
-    start = time.perf_counter_ns() 
-    query_params_str = "&".join([f"{key}={value}" for key,value in query_params.items()])
-    url =  f"{url}/?{query_params_str}"
-    response = requests.get(url)
+    backoff = INITIAL_RETRY_TIMEOUT_S
+    retries = MAX_RETRIES
+    while retries > 0:
+      start = time.perf_counter_ns() 
+      query_params_str = "&".join([f"{key}={value}" for key,value in query_params.items()])
+      url =  f"{url}/?{query_params_str}"
+      response = requests.get(url)
+      end = time.perf_counter_ns()
+      diff = (end-start)
+      try:
+        if raise_error:
+          response.raise_for_status()
+          if 'application/json' in response.headers.get('Content-Type'):
+            content = response.json()
+            self._metadata.total_requests += 1
+            self._metadata.total_request_time += diff
+            return content, response.status_code
+          else:
+              raise Exception("NOT_JSON")
+      except Exception as e:
+        pass
+      retries -= 1
+      time.sleep(backoff)
+      backoff *= RETRY_BACKOFF_MUL
+    
     self._metadata.total_requests += 1
-    end = time.perf_counter_ns()
-    diff = (end-start)
-    self._metadata.total_request_time += diff
-    try:
-      if raise_error:
-        response.raise_for_status()
-        if 'application/json' in response.headers.get('Content-Type'):
-          content = response.json()
-          return content, response.status_code
-        else:
-            raise Exception("NOT_JSON")
-    except Exception as e:
-      self._metadata.total_failed_requests += 1
-      if isinstance(e, requests.HTTPError):
-        self._metadata.failed_request_code_map[response.status_code] += 1
-      else:
-        self._metadata.failed_request_code_map[str(e)] += 1
-      raise e
+    self._metadata.total_failed_requests += 1
+    self._metadata.failed_request_code_map["MAX_RETRIES"] += 1
+    print("Failed max retries")
+    raise Exception("Failed: Max retries")
 
 

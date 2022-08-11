@@ -1,4 +1,6 @@
+from collections import defaultdict
 from math import ceil
+import threading
 from tkinter.tix import MAX
 from typing import Optional
 
@@ -60,22 +62,36 @@ class IndigoRetriever(MangaFetcher):
 
 
   def _get_manga(self) -> MangaCollection:
-    def get_manga_bulk_processor_method(page_range: list[int]) -> list[Manga]:
-      return self.get_manga_bulk(page_range[0], page_range[-1])
-    
     self._metadata.dynamic_data['failed_pages'] = []
     page_range = list(range(1, MAX_PAGES+1))
-    processor = MultithreadProcessor(page_range, get_manga_bulk_processor_method, thread_count=100)
-    return MangaCollection(processor.run_and_aggregrate())
+    self._metadata.dynamic_data['pages_processed'] = {i:0 for i in page_range}
+    processor = MultithreadProcessor(page_range, self.get_manga_bulk, thread_count=100)
+    mangas= MangaCollection(processor.run_and_aggregrate())
+
+    # post processing stats
+    pages_processed = self._metadata.dynamic_data['pages_processed'].items()
+    self._metadata.dynamic_data['repeated_pages'] = [page for page,count in pages_processed if count > 1]
+    failed_pages = self._metadata.dynamic_data['failed_pages']
+    self._metadata.dynamic_data['missed_pages'] = list({page for page,count in pages_processed if count == 0} - set(failed_pages))
+
+    # clean
+    del self._metadata.dynamic_data['pages_processed']
+    return mangas
   
 
-  def get_manga_bulk(self, page_start: int, page_end: int) -> list[Manga]:
+  def get_manga_bulk(self, pages: list[int]) -> list[Manga]:
     mangas: list[Manga] = []
-    for i in range(page_start, page_end+1):
+    for index, i in enumerate(pages):
       try:
+        lock = threading.Lock()
+        lock.acquire()
+        self._metadata.dynamic_data['pages_processed'][i] += 1
+        lock.release()
         mangas += self.get_single_request(i)
-      except Exception: # no more pages
+
+      except Exception as e: # no more pages
         self._metadata.dynamic_data['failed_pages'].append(i)
+        self._metadata.dynamic_data['failed_pages'].extend(pages[index:])
         break
     return mangas
 
